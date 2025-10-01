@@ -112,3 +112,4 @@ venv.bak/
 testing/
 .idea/
 GenAI/MNIST/*
+GenAI/hw1/MNIST/*
