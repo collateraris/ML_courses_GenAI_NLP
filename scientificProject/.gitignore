@@ -113,3 +113,5 @@ testing/
 .idea/
 GenAI/MNIST/*
 GenAI/hw1/MNIST/*
+GenAI/sem5_vae/celeba/*
+GenAI/sem5_vae/MNIST/*
