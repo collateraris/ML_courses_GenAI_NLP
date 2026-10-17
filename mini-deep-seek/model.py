@@ -11,6 +11,9 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+# Targets are already shifted one token ahead of input_ids by the data loader.
+LOSS_VERSION = 2
+
 # --- Configuration Dataclass ---
 
 @dataclass
@@ -268,23 +271,27 @@ class MiniDeepSeek(nn.Module):
         logits_main = self.lm_head(h_main)
         out = {"logits": logits_main}
 
-        main_logits_shift = logits_main[:, :-1, :].contiguous()
-        targets_shift = targets[:, 1:].contiguous()
-        loss_main = F.cross_entropy(main_logits_shift.view(-1, main_logits_shift.size(-1)), targets_shift.view(-1))
-        total_loss = loss_main
+        # The data loader supplies targets[:, t] = the token after input_ids[:, t].
+        loss_main = F.cross_entropy(logits_main.reshape(-1, logits_main.size(-1)), targets.reshape(-1))
+        loss_mtp = loss_main.new_zeros(())
 
         h_prev = h_main
         for k, mtp_block in enumerate(self.mtp_modules, start=1):
-            if S <= k + 1: break
-            h_prev_shifted = h_prev[:, :-(k+1), :].contiguous()
-            next_tokens_embed = self.embed(input_ids[:, k:-1]).contiguous()
+            if S <= k: break
+            # Each MTP depth consumes the next known token and predicts one
+            # token further ahead, using the preceding depth's hidden states.
+            h_prev_shifted = h_prev[:, :-1, :].contiguous()
+            next_tokens_embed = self.embed(input_ids[:, k:]).contiguous()
             h_k = mtp_block(h_prev_shifted, next_tokens_embed)
             logits_k = self.lm_head(self.norm_f(h_k))
-            mtp_targets = targets[:, k+1:].contiguous()
+            mtp_targets = targets[:, k:].contiguous()
             loss_k = F.cross_entropy(logits_k.reshape(-1, logits_k.size(-1)), mtp_targets.reshape(-1))
-            total_loss += mtp_weight * loss_k
-            
-        out["loss"] = total_loss
+            loss_mtp = loss_mtp + loss_k
+            h_prev = h_k
+
+        out["loss_main"] = loss_main
+        out["loss_mtp"] = loss_mtp
+        out["loss"] = loss_main + mtp_weight * loss_mtp
         return out
 
 # --- Example Instantiation for testing ---
@@ -294,8 +301,9 @@ if __name__ == '__main__':
     print(f"Model created with {sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters")
 
     print("\n--- Testing Training Forward Pass ---")
-    dummy_input = torch.randint(0, 1000, (2, 64))
-    output = model(dummy_input, targets=dummy_input)
+    dummy_tokens = torch.randint(0, 1000, (2, 65))
+    dummy_input, dummy_targets = dummy_tokens[:, :-1], dummy_tokens[:, 1:]
+    output = model(dummy_input, targets=dummy_targets)
     print("Logits shape:", output['logits'].shape)
     print("Loss value:", output['loss'].item())
 
