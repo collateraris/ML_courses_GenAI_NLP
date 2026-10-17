@@ -2,6 +2,7 @@
 # This script trains the MiniDeepSeek model on the tokenized TinyStories dataset.
 # It is designed to run on a single GPU.
 
+import argparse
 import os
 import json
 import time
@@ -14,6 +15,7 @@ from torch.nn import functional as F
 
 # Import the model definition from model.py
 from model import MiniDeepSeek, ModelArgs
+from checkpoints import load_latest_checkpoint, save_checkpoint
 
 # --- Configuration ---
 # System
@@ -27,7 +29,7 @@ ctx = torch.amp.autocast(device_type=device.split(':')[0], dtype=pt_dtype) if 'c
 # Training
 out_dir = 'out'
 data_dir = 'data/tinystories_tokenized' # Points to the generic output directory
-max_iters = 5000
+max_iters = 30000            # Total iteration limit, including resumed steps
 eval_interval = 250          # Evaluate less frequently on a longer run
 log_interval = 20
 eval_iters = 100
@@ -78,8 +80,28 @@ def get_lr(it):
     return min_lr + coeff * (learning_rate - min_lr)
 
 
+def make_checkpoint(model, optimizer, model_args, iter_num, val_loss, best_val_loss):
+    return {
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'model_args': model_args,
+        'iter_num': iter_num,
+        'val_loss': val_loss,
+        'best_val_loss': best_val_loss,
+        'rng_state': torch.get_rng_state(),
+        'cuda_rng_state': torch.cuda.get_rng_state_all() if 'cuda' in device else None,
+    }
+
+
 # --- Main Training Script ---
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Train, automatically resuming the latest checkpoint.')
+    parser.add_argument('--max-iters', type=int, default=max_iters,
+                        help='Total iteration limit, including steps already saved (default: %(default)s).')
+    cli_args = parser.parse_args()
+    if cli_args.max_iters <= 0:
+        parser.error('--max-iters must be positive')
+    max_iters = cli_args.max_iters
     os.makedirs(out_dir, exist_ok=True)
 
     # 1. Load Metadata and Initialize Model
@@ -93,23 +115,47 @@ if __name__ == '__main__':
         print("Please run prepare.py first to tokenize the dataset.")
         exit(1)
 
-    # Model configuration for a ~18.5M parameter model
-    # "FLAGSHIP" CONFIGURATION FOR RTX 4090 (~130M parameters)
-    model_args = ModelArgs(
-        d_model=768,                # Standard "small" model dimension
-        n_layers=12,                # 12 layers deep
-        num_heads=12,               # 12 attention heads (d_head=64)
-        d_latent=192,               # Latent dim for MLA (3 * d_head)
-        d_rope=64,                  # RoPE dim, same as d_head
-        moe_n_routed_experts=16,    # A good number of experts to allow specialization
-        moe_n_shared_experts=1,     # One generalist expert for common knowledge
-        moe_top_k=4,                # Route to the best 4 experts per token
-        moe_routed_hidden=512,      # Each expert is reasonably sized
-        vocab_size=vocab_size,      # 50257 from our data
-        max_seq_len=block_size
-    )
+    checkpoint, checkpoint_path = load_latest_checkpoint(out_dir)
+    start_iter = checkpoint['iter_num'] + 1 if checkpoint is not None else 0
+    if start_iter >= max_iters:
+        print(f"Checkpoint {checkpoint_path} already contains {start_iter} completed steps.")
+        print(f"Use --max-iters greater than {start_iter} to continue training.")
+        raise SystemExit(0)
+
+    if checkpoint is not None:
+        model_args = checkpoint['model_args']
+        if isinstance(model_args, dict):
+            model_args = ModelArgs(**model_args)
+        if model_args.vocab_size != vocab_size:
+            raise ValueError('Checkpoint vocabulary size does not match the tokenized dataset.')
+        block_size = model_args.max_seq_len
+        print(f"Resuming from {checkpoint_path} at iteration {start_iter} (limit: {max_iters}).")
+    else:
+        print('No checkpoint found; starting training from scratch.')
+        # Default configuration for a new model on RTX 4090.
+        model_args = ModelArgs(
+            d_model=768,                # Standard "small" model dimension
+            n_layers=12,                # 12 layers deep
+            num_heads=12,               # 12 attention heads (d_head=64)
+            d_latent=192,               # Latent dim for MLA (3 * d_head)
+            d_rope=64,                  # RoPE dim, same as d_head
+            moe_n_routed_experts=16,    # A good number of experts to allow specialization
+            moe_n_shared_experts=1,     # One generalist expert for common knowledge
+            moe_top_k=4,                # Route to the best 4 experts per token
+            moe_routed_hidden=512,      # Each expert is reasonably sized
+            vocab_size=vocab_size,      # 50257 from our data
+            max_seq_len=block_size
+        )
     
     model = MiniDeepSeek(model_args)
+    if checkpoint is not None:
+        prefix = '_orig_mod.'
+        state_dict = {
+            key[len(prefix):] if key.startswith(prefix) else key: value
+            for key, value in checkpoint['model'].items()
+        }
+        model.load_state_dict(state_dict)
+        del state_dict
     model.to(device)
     
     # --- Calculate and Print Total Parameters ---
@@ -121,11 +167,21 @@ if __name__ == '__main__':
 
     # 2. Setup Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(beta1, beta2))
+    best_val_loss = float('inf')
+    val_loss = float('inf')
+    if checkpoint is not None:
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        best_val_loss = checkpoint['best_val_loss']
+        val_loss = float(checkpoint.get('val_loss', float('inf')))
+        if checkpoint.get('rng_state') is not None:
+            torch.set_rng_state(checkpoint['rng_state'])
+        if 'cuda' in device and checkpoint.get('cuda_rng_state') is not None:
+            torch.cuda.set_rng_state_all(checkpoint['cuda_rng_state'])
+        del checkpoint
 
     # 3. Training Loop
     t0 = time.time()
-    best_val_loss = float('inf') # Initialize with infinity
-    for iter_num in range(max_iters):
+    for iter_num in range(start_iter, max_iters):
         # --- Update Learning Rate ---
         lr = get_lr(iter_num)
         for param_group in optimizer.param_groups:
@@ -164,30 +220,33 @@ if __name__ == '__main__':
                         outputs = model(X, targets=Y)
                         losses[k] = outputs['loss'].item()
             
-            val_loss = losses.mean()
+            val_loss = losses.mean().item()
             print(f"iter {iter_num}: validation loss {val_loss:.4f}")
 
             # --- Checkpointing ---
-            checkpoint = {
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'model_args': model_args,
-                'iter_num': iter_num,
-                'val_loss': val_loss.item(),
-            }
+            is_best = val_loss < best_val_loss
+            best_val_loss = min(best_val_loss, val_loss)
+            checkpoint = make_checkpoint(model, optimizer, model_args, iter_num, val_loss, best_val_loss)
+            latest_ckpt_path = os.path.join(out_dir, 'last_ckpt.pt')
+            print(f"Saving latest checkpoint to {latest_ckpt_path}")
+            save_checkpoint(checkpoint, latest_ckpt_path)
 
             # 1. Save the best model so far
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+            if is_best:
                 best_ckpt_path = os.path.join(out_dir, 'best_ckpt.pt')
                 print(f"New best validation loss: {val_loss:.4f}. Saving best checkpoint to {best_ckpt_path}")
-                torch.save(checkpoint, best_ckpt_path)
+                save_checkpoint(checkpoint, best_ckpt_path)
 
             # 2. Save a periodic checkpoint every 500 iterations
             save_interval = 500
             if iter_num % save_interval == 0 and iter_num > 0:
                 periodic_ckpt_path = os.path.join(out_dir, f'ckpt_iter_{iter_num}.pt')
                 print(f"Saving periodic checkpoint to {periodic_ckpt_path}")
-                torch.save(checkpoint, periodic_ckpt_path)
+                save_checkpoint(checkpoint, periodic_ckpt_path)
 
+    # Keep the final updates even when the last iteration is not an evaluation.
+    final_ckpt_path = os.path.join(out_dir, 'last_ckpt.pt')
+    checkpoint = make_checkpoint(model, optimizer, model_args, iter_num, val_loss, best_val_loss)
+    print(f"Saving final checkpoint to {final_ckpt_path}")
+    save_checkpoint(checkpoint, final_ckpt_path)
     print("\nTraining complete.")
